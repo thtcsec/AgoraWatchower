@@ -21,8 +21,10 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, WebSocket
+from fastapi import FastAPI, Header, HTTPException, WebSocket, Query
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from agora_token import generate_rtc_token
 
 load_dotenv()
 
@@ -255,7 +257,15 @@ async def _lifespan(app: FastAPI):
         udp_transport.close()
 
 
-app = FastAPI(title="SentinelStream Log Exporter", lifespan=_lifespan)
+app = FastAPI(title="AgoraWatchtower Security Agent", lifespan=_lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 async def _syslog_consumer(queue: asyncio.Queue, h: WsHub) -> None:
@@ -276,9 +286,46 @@ async def _syslog_consumer(queue: asyncio.Queue, h: WsHub) -> None:
             logger.debug("Syslog message received but no WebSocket clients connected")
 
 
+class SecurityAlert(BaseModel):
+    message: str = Field(..., min_length=1, max_length=1024)
+    severity: str = Field(default="critical", max_length=32)
+    source: str = Field(default="unknown", max_length=128)
+    channel: str = Field(default="watchtower", max_length=128)
+
+
 @app.get("/")
 def read_root():
-    return {"status": "running", "component": "SentinelStream.Agent"}
+    return {"status": "running", "component": "AgoraWatchtower.Agent"}
+
+
+@app.get("/api/token")
+def get_token(
+    channelName: str = Query(..., description="Name of the Agora channel"),
+    uid: str = Query(..., description="User ID or string account name"),
+    role: int = Query(1, description="1 = Publisher, 2 = Subscriber")
+):
+    """Retrieve an Agora RTC token for a channel and user account/uid."""
+    token = generate_rtc_token(channelName, uid, role=role)
+    app_id = os.getenv("AGORA_APP_ID", "").strip()
+    return {
+        "token": token,
+        "appId": app_id
+    }
+
+
+@app.post("/api/alert")
+async def trigger_alert(alert: SecurityAlert):
+    """Manually trigger a security alert, broadcasting it to all connected dashboards."""
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": "alert",
+        "severity": alert.severity.lower(),
+        "source": alert.source,
+        "message": alert.message,
+        "channel": alert.channel,
+    }
+    n = await hub.broadcast(payload)
+    return {"ok": True, "delivered_to_ws_clients": n, "payload": payload}
 
 
 @app.get("/health")
